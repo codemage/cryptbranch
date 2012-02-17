@@ -1,0 +1,337 @@
+#!/usr/bin/env python
+
+from errno import EAGAIN
+from fcntl import fcntl, F_SETFL, F_GETFL
+import keyring
+import os
+from os import O_NONBLOCK
+import sys
+from os.path import join as pjoin
+import select
+from select import POLLIN, POLLOUT, POLLERR
+
+from subprocess import Popen, PIPE, check_call
+
+def make_nonblocking(fd):
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+
+def env_plus(**kwargs):
+    env = dict(os.environ)
+    env.update(kwargs)
+    return env
+
+class Poller(object):
+    def __init__(self):
+        self._poll = select.poll()
+        self._handlers = {}
+    def register(self, fd, events, handler):
+        make_nonblocking(fd)
+        self._handlers[fd] = handler
+        self._poll.register(fd, events)
+    def unregister(self, fd):
+        del self._handlers[fd]
+        self._poll.unregister(fd)
+    def close(self):
+        pass
+    def poll(self, *args):
+        empty = True
+        for fd, event in self._poll.poll(*args):
+            empty = False
+            self._handlers[fd](fd, event)
+        return empty
+
+class CmdException(Exception):
+    pass
+
+class Cmd(object):
+    def __init__(self, *args, **kwargs):
+        self.cmd = args
+        self.params = kwargs
+    def update(self, **kwargs):
+        self.params.update(kwargs)
+    def proc(self, **kwargs):
+        self.params.update(kwargs)
+        cmd = self.cmd
+        if kwargs.get('shell'):
+            cmd = cmd.join(' ')
+        return Popen(cmd, **self.params)
+    def run(self, input=None, **kwargs):
+        kwargs['stdin'] = kwargs['stdout'] = kwargs['stderr'] = PIPE
+        proc = self.proc(**kwargs)
+        stdout, stderr = proc.communicate(input)
+        if proc.returncode != 0:
+            raise CmdException("Error running %s: %s" % (' '.join(self.cmd), stderr))
+        if stderr:
+            print stderr
+        return stdout
+    def __or__(self, other):
+        if isinstance(other, Cmd):
+            return Pipe(self, other)
+        if isinstance(other, Pipe):
+            other.commands = [self].extend(other.commands)
+        raise TypeError("can't pipe to %s" % type(other))
+    def __str__(self):
+        return "Cmd(%s)" % ' '.join(self.cmd)
+
+class Pipe(object):
+    def __init__(self, *commands):
+        self.commands = list(commands)
+
+    def __or__(self, other):
+        self.commands.append(other)
+        return self
+
+    def _proc(self, cmd):
+        proc = cmd.proc(close_fds=True)
+        #print "Running", cmd, cmd.params['stdin'], cmd.params['stdout'], proc.pid
+        return proc
+
+    def run(self, in_data=''):
+        in_r, self.in_w = os.pipe()
+        self.out_r, out_w = os.pipe()
+        self.err_r, err_w = os.pipe()
+        self.plumbing = [in_r, out_w, err_w]
+        self.procs = []
+        self.commands[0].update(stdin=in_r)
+        self.commands[-1].update(stdout=out_w)
+        for a, b in zip(self.commands[:-1], self.commands[1:]):
+            out_r, out_w = os.pipe()
+            #print "connecting %s -> %d %d -> %s" % (a, out_w, out_r, b)
+            a.update(stdout=out_w, stderr=err_w)
+            b.update(stdin=out_r, stderr=err_w)
+            self.plumbing.extend([out_r, out_w])
+
+        self._errors = []
+        self._left = 3
+
+        procs = map(self._proc, self.commands)
+        for fd in self.plumbing:
+            os.close(fd)
+        self._input = in_data
+        self.stdout = []
+        self.stderr = []
+        self.poller = poller = Poller()
+        poller.register(self.in_w, POLLOUT, self.send_stdin)
+        poller.register(self.out_r, POLLIN, self.read_stdout)
+        poller.register(self.err_r, POLLIN, self.read_stderr)
+        self._procs_active = set(range(len(procs)))
+        while self._left > 0 and len(self._procs_active) > 0:
+            poller.poll(1000)
+            for i, proc in enumerate(procs):
+                if i not in self._procs_active:
+                    continue
+                if proc.returncode is not None or proc.poll():
+                    self._procs_active.remove(i)
+        poller.close()
+        for i, proc in enumerate(procs):
+            if proc.wait() != 0:
+                command = self.commands[i]
+                self._errors.append(
+                    CmdException("%s returned %s in %s" %
+                                 (command, proc.returncode, self)))
+        self.stdout = ''.join(self.stdout)
+        self.stderr = ''.join(self.stderr)
+        if len(self._errors) > 0:
+            if self.stderr:
+                print self.stderr
+            raise self._errors[0]
+        return self.stdout
+
+    def finish(self, fd):
+        self.poller.unregister(fd)
+        os.close(fd)
+        self._left -= 1
+
+    def send_stdin(self, fd, event):
+        #print "send_stdin", fd, event
+        if event & POLLERR:
+            if len(self._input) == 0:
+                self.finish(fd)
+            else:
+                self.finish(fd)
+                self._errors.append(CmdException("can't write input in %s" % self))
+        elif event & POLLOUT:
+            if self._input:
+                written = os.write(fd, self._input[:512])
+                self._input = self._input[written:]
+            else:
+                self.finish(fd)
+        else:
+            #print "closing stdin %d unknown event %x" % (fd, event)
+            self.finish(fd)
+
+    def read_stderr(self, fd, event):
+        #print "read_stderr", fd, event
+        data = os.read(fd, 512)
+        if len(data) == 0:
+            self.finish(fd)
+        else:
+            self.stderr.append(data)
+
+    def read_stdout(self, fd, event):
+        #print "read_stdout", fd, event
+        data = os.read(fd, 512)
+        if len(data) == 0:
+            self.finish(fd)
+        else:
+            self.stdout.append(data)
+
+    def __str__(self):
+        return 'Pipe(%s)' % ' | '.join(map(str, self.commands))
+
+def git(*args, **kwargs):
+    """ returns Cmd that runs git out of repodir """
+    kwargs['cwd'] = repodir
+    args = ['git'] + list(args)
+    return Cmd(*args, **kwargs)
+
+def parse_tree(tree):
+    """ generator yielding tree entries as tuples from a git branch """
+    for entry in tree.split('\0'):
+        if len(entry) == 0:
+            continue
+        mode, objtype, info = entry.split(' ', 2)
+        sha, path = info.split('\t', 1)
+        yield (mode, objtype, sha, path)
+    
+def lstree(branch):
+    """ runs ls-tree -r and returns parse_tree gen of result """
+    tree = git('ls-tree', '-r', '-z', branch).run()
+    return parse_tree(tree)
+
+def encrypt():
+    """ openssl Cmd for encryption """
+    return Cmd('openssl',
+               'enc','-base64','-aes-256-cbc',
+                     '-S',salt,'-k',password)
+
+def decrypt():
+    """ openssl Cmd for decryption """
+    return Cmd('openssl',
+               'enc', '-d',
+               '-base64', '-aes-256-cbc',
+               '-k', password)
+
+def encryptbranch(clearbranch, cipherbranch):
+    """ encrypts a branch in git, creating a new commit on another branch
+        that represents it in a more-or-less opaque form.  Only number
+        of files and approximate distribution of file sizes will be
+        apparent from looking at the cipherbranch without the key."""
+    enc_tree_outer = []
+    enc_tree_inner = []
+    seen_blobs = set()
+    for mode, objtype, sha, path in lstree(clearbranch):
+        if objtype != 'blob':
+            raise Exception("Can't real with object of type " +
+                            objtype + " in repo")
+        enc_sha = (git('cat-file', 'blob', sha) |
+                   encrypt() |
+                   git('hash-object', '-w', '--stdin')).run().strip()
+        enc_tree_inner.append('%s blob %s\t%s\0' % (mode, enc_sha, path))
+        if enc_sha not in seen_blobs:
+            enc_tree_outer.append('100644 blob %s\t%s\0' % (enc_sha, enc_sha))
+            seen_blobs.add(enc_sha)
+
+    enc_tree_inner = ''.join(enc_tree_inner)
+    inner_tree_sha = git('hash-object', '-w', '--stdin').run(enc_tree_inner).strip()
+
+    enc_tree_outer.append('100644 blob %s\ttree\0' % inner_tree_sha)
+    enc_tree_outer = ''.join(enc_tree_outer)
+    outer_tree_sha = git('mktree', '-z').run(enc_tree_outer).strip()
+    
+    cipherbranch = 'refs/heads/'+cipherbranch
+    cipher_parent = []
+    try:
+        parent_commit_sha = git('rev-list', '-n', '1', cipherbranch).run().strip()
+        cipher_parent = ['-p', parent_commit_sha]
+    except CmdException:
+        pass
+
+    # print this info:
+    # sha,parent_sha,author_name,author_email,author_date, \
+    #        committer_name,committer_email,committer_date, \
+    #        commit_msg = orig_commit_info.split('\0')
+    enc_commit_info = (git('log', '-n1',
+            '--pretty=format:%H%x00%P%x00%an%x00%ae%x00%aD%x00%cn%x00%ce%x00%cD%x00%B',
+            clearbranch) | encrypt()).run()
+    enc_message = 'cryptbranch\n\n'
+    enc_message += enc_commit_info
+    enc_commit_sha = git('commit-tree', outer_tree_sha, *cipher_parent).run(enc_message).strip()
+    git('update-ref','-m','cryptbranch',cipherbranch,enc_commit_sha,*cipher_parent[1:]).run()
+
+def mktree_recursive(tree):
+    """ takes flat list of (mode, sha, path) tuples and returns tree sha """
+    local_tree = []
+    subtrees = {}
+    for mode, sha, path in tree:
+        if '/' in path:
+            head, tail = path.split('/', 1)
+            subtrees.setdefault(head, []).append( (mode, sha, tail) )
+        else:
+            local_tree.append('%s blob %s\t%s\0' % (mode, sha, path))
+    for head, subtree in subtrees.iteritems():
+        sub_sha = mktree_recursive(subtree)
+        local_tree.append('040000 tree %s\t%s\0' % (sub_sha, head))
+    local_tree = ''.join(local_tree)
+    return git('mktree', '-z').run(local_tree).strip()
+
+def decryptbranch(cipherbranch, clearbranch):
+    orig_commit_info = (git('log', '-n1', '--pretty=format:%b', cipherbranch) |
+                        decrypt()).run()
+
+    orig_sha,parent_sha,author_name,author_email,author_date, \
+            committer_name,committer_email,committer_date, \
+            commit_msg = orig_commit_info.split('\0')
+
+    dec_tree_inner = git('cat-file', 'blob', '%s:tree' % cipherbranch).run()
+    out_tree = []
+    for mode, objtype, sha, path in parse_tree(dec_tree_inner):
+        dec_sha = (git('cat-file', 'blob', sha) |
+                   decrypt() |
+                   git('hash-object', '-w', '--stdin')).run().strip()
+        out_tree.append((mode, dec_sha, path))
+
+    out_tree_sha = mktree_recursive(out_tree)
+
+    parents = []
+    if parent_sha:
+        # TODO: find out how merge commit parents are represented in %P
+        parents = ['-p', parent_sha]
+    commit_env = env_plus(GIT_AUTHOR_NAME=author_name,
+                          GIT_AUTHOR_EMAIL=author_email,
+                          GIT_AUTHOR_DATE=author_date,
+                          GIT_COMMITTER_NAME=committer_name,
+                          GIT_COMMITTER_EMAIL=committer_email,
+                          GIT_COMMITTER_DATE=committer_date)
+    out_commit_sha = git('commit-tree',out_tree_sha,*parents,env=commit_env).run(commit_msg).strip()
+    if out_commit_sha != orig_sha:
+        print "Warning: original commit %s decrypted to %s" % (orig_sha, out_commit_sha)
+    git('update-ref','-m','decryptbranch','refs/heads/'+clearbranch,out_commit_sha).run()
+
+def load_password():
+    global salt, password
+    info = keyring.get_password('homesync', os.environ['USER'])
+    salt = info[:16]
+    password = info[16:]
+
+def main(argv):
+    global repodir
+    repodir = pjoin(os.environ['HOME'],'.homesync')
+
+    import argparse
+    parser = argparse.ArgumentParser(description='cryptbranch')
+    parser.add_argument('action', choices=('encrypt', 'decrypt'), metavar='<encrypt|decrypt>')
+    parser.add_argument('-o', '--clearbranch', default='clear', metavar='<commit-ish>')
+    parser.add_argument('-x', '--cipherbranch', default='crypt', metavar='<branch>')
+    config = parser.parse_args(argv)
+    load_password()
+    if config.action == 'encrypt':
+        encryptbranch(config.clearbranch, config.cipherbranch)
+    else:
+        decryptbranch(config.cipherbranch, config.clearbranch)
+
+if __name__ == '__main__':
+    main(sys.argv[1:])
+    # print (Cmd('echo','foo','bar') | Cmd('cat')).run()
+
+

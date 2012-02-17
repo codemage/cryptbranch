@@ -1,0 +1,20 @@
+This tool allows you to encrypt the contents of a git commit, such that the
+encrypted branch can be pushed, pulled elsewhere, and then decrypted.
+Encryption uses a fixed salt, so it is potentially vulnerable to a skilled
+attacker; this is necessary to allow git to handle the encrypted content
+efficiently.  Use at your own risk.
+
+Designed for moving personal data around in a moderately safe format.
+Stores encryption keys in GNOME keyring.  Use 'genpass > keyfile' to initialize
+a key; use 'setpass < keyfile' on any other host to import the key
+into the keyring.  Delete the keyfile on all hosts when done setting up.
+
+Use 'cryptbranch encrypt -o <cleartext commit> -x <encrypted branch>' to
+encrypt the commit given in '-o' and append the resulting encrypted commit
+to the encrypted branch given in '-x'.
+
+Use 'cryptbranch decrypt -o <cleartext branch> -x <encrypted commit>' to
+decrypt the encrypted commit at '-x' and (if the parent commit is available
+in the repository) make the decrypted commit the head of the branch
+specified in '-o'.
+
